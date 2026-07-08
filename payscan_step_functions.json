@@ -1,0 +1,480 @@
+{
+  "Comment": "PayScan AI Agent - Invoice Processing Workflow",
+  "StartAt": "ValidateInput",
+  "States": {
+    "ValidateInput": {
+      "Type": "Pass",
+      "Comment": "Validate input parameters",
+      "Parameters": {
+        "job_id.$": "$.job_id",
+        "source_bucket.$": "$.source_bucket",
+        "source_key.$": "$.source_key",
+        "sagemaker_endpoint.$": "$.sagemaker_endpoint",
+        "processing_bucket.$": "$.processing_bucket",
+        "results_bucket.$": "$.results_bucket",
+        "timestamp.$": "$$.State.EnteredTime"
+      },
+      "Next": "CheckSageMakerEndpoint"
+    },
+    
+    "CheckSageMakerEndpoint": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "${PayScanOrchestratorFunction}",
+        "Payload": {
+          "action": "check_endpoint",
+          "job_id.$": "$.job_id"
+        }
+      },
+      "ResultPath": "$.endpoint_status",
+      "Next": "IsEndpointReady",
+      "Retry": [
+        {
+          "ErrorEquals": ["States.TaskFailed"],
+          "IntervalSeconds": 30,
+          "MaxAttempts": 3,
+          "BackoffRate": 2.0
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "Next": "HandleEndpointError",
+          "ResultPath": "$.error"
+        }
+      ]
+    },
+    
+    "IsEndpointReady": {
+      "Type": "Choice",
+      "Choices": [
+        {
+          "Variable": "$.endpoint_status.Payload.status",
+          "StringEquals": "InService",
+          "Next": "ExtractWithTextract"
+        },
+        {
+          "Variable": "$.endpoint_status.Payload.status",
+          "StringEquals": "Creating",
+          "Next": "WaitForEndpoint"
+        }
+      ],
+      "Default": "StartEndpoint"
+    },
+    
+    "StartEndpoint": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "${PayScanOrchestratorFunction}",
+        "Payload": {
+          "action": "start_endpoint",
+          "job_id.$": "$.job_id"
+        }
+      },
+      "ResultPath": "$.endpoint_start_result",
+      "Next": "WaitForEndpoint",
+      "Retry": [
+        {
+          "ErrorEquals": ["States.TaskFailed"],
+          "IntervalSeconds": 60,
+          "MaxAttempts": 3,
+          "BackoffRate": 2.0
+        }
+      ]
+    },
+    
+    "WaitForEndpoint": {
+      "Type": "Wait",
+      "Seconds": 300,
+      "Comment": "Wait 5 minutes for endpoint to start",
+      "Next": "CheckSageMakerEndpoint"
+    },
+    
+    "ExtractWithTextract": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "${PayScanTextractFunction}",
+        "Payload": {
+          "source_bucket.$": "$.source_bucket",
+          "source_key.$": "$.source_key",
+          "job_id.$": "$.job_id",
+          "processing_bucket.$": "$.processing_bucket"
+        }
+      },
+      "ResultPath": "$.textract_result",
+      "Next": "ProcessWithSageMaker",
+      "Retry": [
+        {
+          "ErrorEquals": ["States.TaskFailed"],
+          "IntervalSeconds": 30,
+          "MaxAttempts": 3,
+          "BackoffRate": 2.0
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "Next": "HandleTextractError",
+          "ResultPath": "$.error"
+        }
+      ]
+    },
+    
+    "ProcessWithSageMaker": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "${PayScanSageMakerFunction}",
+        "Payload": {
+          "textract_data.$": "$.textract_result.Payload",
+          "sagemaker_endpoint.$": "$.sagemaker_endpoint",
+          "job_id.$": "$.job_id",
+          "processing_bucket.$": "$.processing_bucket"
+        }
+      },
+      "ResultPath": "$.sagemaker_result",
+      "Next": "AnalyzeWithBedrock",
+      "Retry": [
+        {
+          "ErrorEquals": ["States.TaskFailed"],
+          "IntervalSeconds": 60,
+          "MaxAttempts": 3,
+          "BackoffRate": 2.0
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "Next": "HandleSageMakerError",
+          "ResultPath": "$.error"
+        }
+      ]
+    },
+    
+    "AnalyzeWithBedrock": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "${PayScanBedrockFunction}",
+        "Payload": {
+          "invoice_data.$": "$.sagemaker_result.Payload",
+          "textract_data.$": "$.textract_result.Payload",
+          "job_id.$": "$.job_id",
+          "processing_bucket.$": "$.processing_bucket"
+        }
+      },
+      "ResultPath": "$.bedrock_result",
+      "Next": "StoreResults",
+      "Retry": [
+        {
+          "ErrorEquals": ["States.TaskFailed"],
+          "IntervalSeconds": 30,
+          "MaxAttempts": 3,
+          "BackoffRate": 2.0
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "Next": "HandleBedrockError",
+          "ResultPath": "$.error"
+        }
+      ]
+    },
+    
+    "StoreResults": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "${PayScanStorageFunction}",
+        "Payload": {
+          "job_id.$": "$.job_id",
+          "textract_data.$": "$.textract_result.Payload",
+          "sagemaker_data.$": "$.sagemaker_result.Payload",
+          "bedrock_data.$": "$.bedrock_result.Payload",
+          "results_bucket.$": "$.results_bucket",
+          "source_info": {
+            "bucket.$": "$.source_bucket",
+            "key.$": "$.source_key"
+          }
+        }
+      },
+      "ResultPath": "$.storage_result",
+      "Next": "CheckForDuplicates",
+      "Retry": [
+        {
+          "ErrorEquals": ["States.TaskFailed"],
+          "IntervalSeconds": 30,
+          "MaxAttempts": 3,
+          "BackoffRate": 2.0
+        }
+      ]
+    },
+    
+    "CheckForDuplicates": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "${PayScanDuplicateFunction}",
+        "Payload": {
+          "job_id.$": "$.job_id",
+          "invoice_data.$": "$.bedrock_result.Payload.structured_data",
+          "results_bucket.$": "$.results_bucket"
+        }
+      },
+      "ResultPath": "$.duplicate_check",
+      "Next": "GenerateReport",
+      "Retry": [
+        {
+          "ErrorEquals": ["States.TaskFailed"],
+          "IntervalSeconds": 30,
+          "MaxAttempts": 2,
+          "BackoffRate": 2.0
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "Next": "GenerateReport",
+          "ResultPath": "$.duplicate_error"
+        }
+      ]
+    },
+    
+    "GenerateReport": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "${PayScanReportFunction}",
+        "Payload": {
+          "job_id.$": "$.job_id",
+          "processing_results": {
+            "textract.$": "$.textract_result.Payload",
+            "sagemaker.$": "$.sagemaker_result.Payload",
+            "bedrock.$": "$.bedrock_result.Payload",
+            "duplicate_check.$": "$.duplicate_check.Payload",
+            "storage.$": "$.storage_result.Payload"
+          },
+          "results_bucket.$": "$.results_bucket"
+        }
+      },
+      "ResultPath": "$.report_result",
+      "Next": "SendNotification",
+      "Retry": [
+        {
+          "ErrorEquals": ["States.TaskFailed"],
+          "IntervalSeconds": 30,
+          "MaxAttempts": 2,
+          "BackoffRate": 2.0
+        }
+      ]
+    },
+    
+    "SendNotification": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "${PayScanNotificationFunction}",
+        "Payload": {
+          "job_id.$": "$.job_id",
+          "status": "completed",
+          "results_summary.$": "$.report_result.Payload.summary",
+          "alerts.$": "$.bedrock_result.Payload.alerts"
+        }
+      },
+      "ResultPath": "$.notification_result",
+      "Next": "CheckAutoStop",
+      "Retry": [
+        {
+          "ErrorEquals": ["States.TaskFailed"],
+          "IntervalSeconds": 30,
+          "MaxAttempts": 2,
+          "BackoffRate": 1.5
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "Next": "CheckAutoStop",
+          "ResultPath": "$.notification_error"
+        }
+      ]
+    },
+    
+    "CheckAutoStop": {
+      "Type": "Choice",
+      "Comment": "Check if we should auto-stop SageMaker endpoint",
+      "Choices": [
+        {
+          "Variable": "$.auto_stop_endpoint",
+          "BooleanEquals": true,
+          "Next": "WaitBeforeStop"
+        }
+      ],
+      "Default": "ProcessingComplete"
+    },
+    
+    "WaitBeforeStop": {
+      "Type": "Wait",
+      "Seconds": 300,
+      "Comment": "Wait 5 minutes before stopping endpoint (in case more files arrive)",
+      "Next": "CheckPendingJobs"
+    },
+    
+    "CheckPendingJobs": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "${PayScanOrchestratorFunction}",
+        "Payload": {
+          "action": "check_pending_jobs",
+          "job_id.$": "$.job_id"
+        }
+      },
+      "ResultPath": "$.pending_jobs",
+      "Next": "ShouldStopEndpoint",
+      "Retry": [
+        {
+          "ErrorEquals": ["States.TaskFailed"],
+          "IntervalSeconds": 30,
+          "MaxAttempts": 2,
+          "BackoffRate": 2.0
+        }
+      ]
+    },
+    
+    "ShouldStopEndpoint": {
+      "Type": "Choice",
+      "Choices": [
+        {
+          "Variable": "$.pending_jobs.Payload.has_pending",
+          "BooleanEquals": false,
+          "Next": "StopSageMakerEndpoint"
+        }
+      ],
+      "Default": "ProcessingComplete"
+    },
+    
+    "StopSageMakerEndpoint": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "${PayScanOrchestratorFunction}",
+        "Payload": {
+          "action": "stop_endpoint",
+          "job_id.$": "$.job_id"
+        }
+      },
+      "ResultPath": "$.endpoint_stop_result",
+      "Next": "ProcessingComplete",
+      "Retry": [
+        {
+          "ErrorEquals": ["States.TaskFailed"],
+          "IntervalSeconds": 30,
+          "MaxAttempts": 2,
+          "BackoffRate": 2.0
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "Next": "ProcessingComplete",
+          "ResultPath": "$.endpoint_stop_error"
+        }
+      ]
+    },
+    
+    "ProcessingComplete": {
+      "Type": "Pass",
+      "Comment": "Processing completed successfully",
+      "Parameters": {
+        "job_id.$": "$.job_id",
+        "status": "completed",
+        "completion_time.$": "$.State.EnteredTime",
+        "results": {
+          "textract_success.$": "$.textract_result.Payload.success",
+          "sagemaker_success.$": "$.sagemaker_result.Payload.success",
+          "bedrock_success.$": "$.bedrock_result.Payload.success",
+          "storage_success.$": "$.storage_result.Payload.success",
+          "report_generated.$": "$.report_result.Payload.success"
+        }
+      },
+      "End": true
+    },
+    
+    "HandleEndpointError": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "${PayScanNotificationFunction}",
+        "Payload": {
+          "job_id.$": "$.job_id",
+          "status": "failed",
+          "error_type": "endpoint_error",
+          "error_details.$": "$.error"
+        }
+      },
+      "Next": "ProcessingFailed"
+    },
+    
+    "HandleTextractError": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "${PayScanNotificationFunction}",
+        "Payload": {
+          "job_id.$": "$.job_id",
+          "status": "failed",
+          "error_type": "textract_error",
+          "error_details.$": "$.error"
+        }
+      },
+      "Next": "ProcessingFailed"
+    },
+    
+    "HandleSageMakerError": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "${PayScanNotificationFunction}",
+        "Payload": {
+          "job_id.$": "$.job_id",
+          "status": "failed",
+          "error_type": "sagemaker_error",
+          "error_details.$": "$.error"
+        }
+      },
+      "Next": "ProcessingFailed"
+    },
+    
+    "HandleBedrockError": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "${PayScanNotificationFunction}",
+        "Payload": {
+          "job_id.$": "$.job_id",
+          "status": "failed",
+          "error_type": "bedrock_error",
+          "error_details.$": "$.error"
+        }
+      },
+      "Next": "ProcessingFailed"
+    },
+    
+    "ProcessingFailed": {
+      "Type": "Pass",
+      "Comment": "Processing failed",
+      "Parameters": {
+        "job_id.$": "$.job_id",
+        "status": "failed",
+        "failure_time.$": "$.State.EnteredTime",
+        "error.$": "$.error"
+      },
+      "End": true
+    }
+  }
+}

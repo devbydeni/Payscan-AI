@@ -1,0 +1,1082 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'PayScan AI Agent - Complete Infrastructure Deployment'
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: payscan
+    Description: Project name for resource naming
+    
+  Environment:
+    Type: String
+    Default: prod
+    AllowedValues: [dev, staging, prod]
+    Description: Environment name
+    
+  NotificationEmail:
+    Type: String
+    Description: Email address for notifications
+    
+  SageMakerInstanceType:
+    Type: String
+    Default: ml.g4dn.xlarge
+    Description: SageMaker instance type for Mistral model
+    AllowedValues: 
+      - ml.g4dn.xlarge
+      - ml.g4dn.2xlarge
+      - ml.g5.xlarge
+      - ml.g5.2xlarge
+
+Resources:
+  # S3 Buckets
+  UploadBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${ProjectName}-uploads-${Environment}-${AWS::AccountId}'
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      VersioningConfiguration:
+        Status: Enabled
+      LifecycleConfiguration:
+        Rules:
+          - Id: DeleteOldVersions
+            Status: Enabled
+            NoncurrentVersionExpirationInDays: 30
+      NotificationConfiguration:
+        LambdaConfigurations:
+          - Event: s3:ObjectCreated:*
+            Function: !GetAtt OrchestratorFunction.Arn
+            Filter:
+              S3Key:
+                Rules:
+                  - Name: suffix
+                    Value: .pdf
+          - Event: s3:ObjectCreated:*
+            Function: !GetAtt OrchestratorFunction.Arn
+            Filter:
+              S3Key:
+                Rules:
+                  - Name: suffix
+                    Value: .jpg
+          - Event: s3:ObjectCreated:*
+            Function: !GetAtt OrchestratorFunction.Arn
+            Filter:
+              S3Key:
+                Rules:
+                  - Name: suffix
+                    Value: .png
+
+  ProcessingBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${ProjectName}-processing-${Environment}-${AWS::AccountId}'
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LifecycleConfiguration:
+        Rules:
+          - Id: DeleteProcessingFiles
+            Status: Enabled
+            ExpirationInDays: 90
+
+  ResultsBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${ProjectName}-results-${Environment}-${AWS::AccountId}'
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      VersioningConfiguration:
+        Status: Enabled
+
+  # DynamoDB Table for Agent Memory
+  AgentMemoryTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub '${ProjectName}-agent-memory-${Environment}'
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: session_id
+          AttributeType: S
+        - AttributeName: job_id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: session_id
+          KeyType: HASH
+      GlobalSecondaryIndexes:
+        - IndexName: job-id-index
+          KeySchema:
+            - AttributeName: job_id
+              KeyType: HASH
+          Projection:
+            ProjectionType: ALL
+      TimeToLiveSpecification:
+        AttributeName: ttl
+        Enabled: true
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  # SNS Topic for Notifications
+  NotificationTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub '${ProjectName}-notifications-${Environment}'
+      DisplayName: PayScan AI Agent Notifications
+      Subscription:
+        - Protocol: email
+          Endpoint: !Ref NotificationEmail
+
+  # IAM Roles
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-lambda-execution-role-${Environment}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: PayScanLambdaPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:DeleteObject
+                  - s3:ListBucket
+                Resource:
+                  - !Sub '${UploadBucket}/*'
+                  - !Sub '${ProcessingBucket}/*'
+                  - !Sub '${ResultsBucket}/*'
+                  - !GetAtt UploadBucket.Arn
+                  - !GetAtt ProcessingBucket.Arn
+                  - !GetAtt ResultsBucket.Arn
+              - Effect: Allow
+                Action:
+                  - textract:AnalyzeDocument
+                  - textract:StartDocumentAnalysis
+                  - textract:GetDocumentAnalysis
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - sagemaker:InvokeEndpoint
+                  - sagemaker:DescribeEndpoint
+                  - sagemaker:CreateEndpoint
+                  - sagemaker:DeleteEndpoint
+                Resource: 
+                  - !Sub 'arn:aws:sagemaker:${AWS::Region}:${AWS::AccountId}:endpoint/${ProjectName}-mistral-endpoint'
+                  - !Sub 'arn:aws:sagemaker:${AWS::Region}:${AWS::AccountId}:endpoint-config/${ProjectName}-mistral-config'
+              - Effect: Allow
+                Action:
+                  - bedrock-agent:InvokeAgent
+                  - bedrock-agent-runtime:InvokeAgent
+                Resource: !Sub 'arn:aws:bedrock:${AWS::Region}:${AWS::AccountId}:agent/*'
+              - Effect: Allow
+                Action:
+                  - dynamodb:PutItem
+                  - dynamodb:GetItem
+                  - dynamodb:UpdateItem
+                  - dynamodb:DeleteItem
+                  - dynamodb:Query
+                  - dynamodb:Scan
+                Resource: !GetAtt AgentMemoryTable.Arn
+              - Effect: Allow
+                Action:
+                  - states:StartExecution
+                Resource: !Ref ProcessingStateMachine
+              - Effect: Allow
+                Action:
+                  - sns:Publish
+                Resource: !Ref NotificationTopic
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: '*'
+
+  StepFunctionsExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-stepfunctions-role-${Environment}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: states.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: PayScanStepFunctionsPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - lambda:InvokeFunction
+                Resource:
+                  - !GetAtt OrchestratorFunction.Arn
+                  - !GetAtt TextractFunction.Arn
+                  - !GetAtt SageMakerFunction.Arn
+                  - !GetAtt BedrockFunction.Arn
+                  - !GetAtt StorageFunction.Arn
+                  - !GetAtt DuplicateFunction.Arn
+                  - !GetAtt ReportFunction.Arn
+                  - !GetAtt NotificationFunction.Arn
+
+  SageMakerExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-sagemaker-role-${Environment}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: sagemaker.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSageMakerFullAccess
+      Policies:
+        - PolicyName: PayScanSageMakerPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                Resource:
+                  - !Sub '${ProcessingBucket}/*'
+                  - !Sub '${ResultsBucket}/*'
+
+  # Lambda Functions
+  OrchestratorFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-orchestrator-${Environment}'
+      Runtime: python3.9
+      Handler: lambda_function.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 900
+      MemorySize: 512
+      Environment:
+        Variables:
+          SAGEMAKER_ENDPOINT_NAME: !Sub '${ProjectName}-mistral-endpoint'
+          SAGEMAKER_ENDPOINT_CONFIG: !Sub '${ProjectName}-mistral-config'
+          SAGEMAKER_MODEL_NAME: !Sub '${ProjectName}-mistral-model'
+          STEP_FUNCTION_ARN: !Ref ProcessingStateMachine
+          SNS_TOPIC_ARN: !Ref NotificationTopic
+          PROCESSING_BUCKET: !Ref ProcessingBucket
+          RESULTS_BUCKET: !Ref ResultsBucket
+          MEMORY_TABLE_NAME: !Ref AgentMemoryTable
+      Code:
+        ZipFile: |
+          # Placeholder - replace with actual code from payscan_lambda_orchestrator.py
+          import json
+          def lambda_handler(event, context):
+              return {'statusCode': 200, 'body': 'Placeholder function'}
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  TextractFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-textract-${Environment}'
+      Runtime: python3.9
+      Handler: lambda_function.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 600
+      MemorySize: 1024
+      Code:
+        ZipFile: |
+          # Placeholder - replace with actual code from payscan_textract_function.py
+          import json
+          def lambda_handler(event, context):
+              return {'statusCode': 200, 'body': 'Placeholder function'}
+
+  SageMakerFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-sagemaker-${Environment}'
+      Runtime: python3.9
+      Handler: lambda_function.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 900
+      MemorySize: 512
+      Environment:
+        Variables:
+          SAGEMAKER_ENDPOINT_NAME: !Sub '${ProjectName}-mistral-endpoint'
+      Code:
+        ZipFile: |
+          # Placeholder - replace with actual code from payscan_sagemaker_function.py
+          import json
+          def lambda_handler(event, context):
+              return {'statusCode': 200, 'body': 'Placeholder function'}
+
+  BedrockFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-bedrock-${Environment}'
+      Runtime: python3.9
+      Handler: lambda_function.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 900
+      MemorySize: 512
+      Environment:
+        Variables:
+          MEMORY_TABLE_NAME: !Ref AgentMemoryTable
+      Code:
+        ZipFile: |
+          # Placeholder - replace with actual code from payscan_bedrock_function.py
+          import json
+          def lambda_handler(event, context):
+              return {'statusCode': 200, 'body': 'Placeholder function'}
+
+  # Additional Lambda Functions (StorageFunction, DuplicateFunction, etc.)
+  StorageFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-storage-${Environment}'
+      Runtime: python3.9
+      Handler: lambda_function.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 300
+      MemorySize: 256
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import logging
+          from datetime import datetime
+          
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+          s3_client = boto3.client('s3')
+          
+          def lambda_handler(event, context):
+              try:
+                  logger.info(f"Storing results: {json.dumps(event, default=str)}")
+                  
+                  job_id = event['job_id']
+                  results_bucket = event['results_bucket']
+                  
+                  # Combine all processing results
+                  final_result = {
+                      'job_id': job_id,
+                      'textract_data': event.get('textract_data', {}),
+                      'sagemaker_data': event.get('sagemaker_data', {}),
+                      'bedrock_data': event.get('bedrock_data', {}),
+                      'source_info': event.get('source_info', {}),
+                      'processing_timestamp': datetime.utcnow().isoformat(),
+                      'status': 'completed'
+                  }
+                  
+                  # Store final result
+                  storage_key = f"processed/{job_id}/final_result.json"
+                  s3_client.put_object(
+                      Bucket=results_bucket,
+                      Key=storage_key,
+                      Body=json.dumps(final_result, default=str, indent=2),
+                      ContentType='application/json'
+                  )
+                  
+                  return {
+                      'success': True,
+                      'job_id': job_id,
+                      'storage_location': f"s3://{results_bucket}/{storage_key}"
+                  }
+                  
+              except Exception as e:
+                  logger.error(f"Error storing results: {str(e)}")
+                  return {'success': False, 'error': str(e)}
+
+  DuplicateFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-duplicate-${Environment}'
+      Runtime: python3.9
+      Handler: lambda_function.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 300
+      MemorySize: 256
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import logging
+          from datetime import datetime
+          
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+          s3_client = boto3.client('s3')
+          
+          def lambda_handler(event, context):
+              try:
+                  logger.info(f"Checking for duplicates: {json.dumps(event, default=str)}")
+                  
+                  job_id = event['job_id']
+                  invoice_data = event['invoice_data']
+                  results_bucket = event['results_bucket']
+                  
+                  # Get current invoice details
+                  current_invoice_id = invoice_data.get('invoice_id')
+                  current_amount = invoice_data.get('amount')
+                  current_vendor = invoice_data.get('vendor_name')
+                  
+                  duplicates_found = []
+                  
+                  if current_invoice_id and current_amount:
+                      # List existing processed invoices
+                      try:
+                          response = s3_client.list_objects_v2(
+                              Bucket=results_bucket,
+                              Prefix='processed/',
+                              MaxKeys=1000
+                          )
+                          
+                          for obj in response.get('Contents', []):
+                              if obj['Key'].endswith('final_result.json') and job_id not in obj['Key']:
+                                  try:
+                                      # Get existing invoice data
+                                      existing_response = s3_client.get_object(
+                                          Bucket=results_bucket,
+                                          Key=obj['Key']
+                                      )
+                                      existing_data = json.loads(existing_response['Body'].read())
+                                      
+                                      existing_bedrock = existing_data.get('bedrock_data', {})
+                                      existing_invoice_id = existing_bedrock.get('invoice_id')
+                                      existing_amount = existing_bedrock.get('amount')
+                                      existing_vendor = existing_bedrock.get('vendor_name')
+                                      
+                                      # Check for duplicates
+                                      is_duplicate = False
+                                      match_reasons = []
+                                      
+                                      if existing_invoice_id and current_invoice_id:
+                                          if existing_invoice_id.lower() == current_invoice_id.lower():
+                                              is_duplicate = True
+                                              match_reasons.append('invoice_id_exact_match')
+                                      
+                                      if existing_amount and current_amount:
+                                          if abs(float(existing_amount) - float(current_amount)) < 0.01:
+                                              if existing_vendor and current_vendor:
+                                                  if existing_vendor.lower() == current_vendor.lower():
+                                                      is_duplicate = True
+                                                      match_reasons.append('amount_vendor_match')
+                                      
+                                      if is_duplicate:
+                                          duplicates_found.append({
+                                              'existing_job_id': existing_data.get('job_id'),
+                                              'existing_invoice_id': existing_invoice_id,
+                                              'existing_amount': existing_amount,
+                                              'existing_vendor': existing_vendor,
+                                              'match_reasons': match_reasons,
+                                              'confidence': 0.95 if 'invoice_id_exact_match' in match_reasons else 0.85
+                                          })
+                                          
+                                  except Exception as e:
+                                      logger.warning(f"Error processing {obj['Key']}: {str(e)}")
+                                      continue
+                                      
+                      except Exception as e:
+                          logger.error(f"Error listing objects: {str(e)}")
+                  
+                  return {
+                      'success': True,
+                      'job_id': job_id,
+                      'duplicates_found': duplicates_found,
+                      'duplicate_count': len(duplicates_found),
+                      'check_timestamp': datetime.utcnow().isoformat()
+                  }
+                  
+              except Exception as e:
+                  logger.error(f"Error checking duplicates: {str(e)}")
+                  return {'success': False, 'error': str(e)}
+
+  ReportFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-report-${Environment}'
+      Runtime: python3.9
+      Handler: lambda_function.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 300
+      MemorySize: 256
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import logging
+          from datetime import datetime
+          
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+          s3_client = boto3.client('s3')
+          
+          def lambda_handler(event, context):
+              try:
+                  logger.info(f"Generating report: {json.dumps(event, default=str)}")
+                  
+                  job_id = event['job_id']
+                  processing_results = event['processing_results']
+                  results_bucket = event['results_bucket']
+                  
+                  # Generate summary report
+                  report = {
+                      'job_id': job_id,
+                      'report_timestamp': datetime.utcnow().isoformat(),
+                      'processing_summary': {
+                          'textract_success': processing_results.get('textract', {}).get('success', False),
+                          'sagemaker_success': processing_results.get('sagemaker', {}).get('success', False),
+                          'bedrock_success': processing_results.get('bedrock', {}).get('success', False),
+                          'duplicate_check_success': processing_results.get('duplicate_check', {}).get('success', False)
+                      },
+                      'invoice_summary': {},
+                      'alerts': [],
+                      'recommendations': []
+                  }
+                  
+                  # Extract key information
+                  if processing_results.get('bedrock', {}).get('success'):
+                      bedrock_data = processing_results['bedrock'].get('curated_invoice_data', {})
+                      report['invoice_summary'] = {
+                          'invoice_id': bedrock_data.get('invoice_id'),
+                          'vendor': bedrock_data.get('vendor_name'),
+                          'amount': bedrock_data.get('amount'),
+                          'due_date': bedrock_data.get('due_date'),
+                          'risk_level': bedrock_data.get('overall_risk_level'),
+                          'data_quality_score': bedrock_data.get('data_quality_score')
+                      }
+                      
+                      report['alerts'] = bedrock_data.get('alerts', [])
+                      report['recommendations'] = bedrock_data.get('recommendations', [])
+                  
+                  # Add duplicate information
+                  if processing_results.get('duplicate_check', {}).get('success'):
+                      duplicate_data = processing_results['duplicate_check']
+                      if duplicate_data.get('duplicate_count', 0) > 0:
+                          report['alerts'].append({
+                              'type': 'duplicate',
+                              'severity': 'high',
+                              'title': 'Duplicate Invoice Detected',
+                              'description': f"Found {duplicate_data['duplicate_count']} potential duplicate(s)",
+                              'details': duplicate_data.get('duplicates_found', [])
+                          })
+                  
+                  # Store report
+                  report_key = f"reports/{job_id}/processing_report.json"
+                  s3_client.put_object(
+                      Bucket=results_bucket,
+                      Key=report_key,
+                      Body=json.dumps(report, default=str, indent=2),
+                      ContentType='application/json'
+                  )
+                  
+                  return {
+                      'success': True,
+                      'job_id': job_id,
+                      'report_location': f"s3://{results_bucket}/{report_key}",
+                      'summary': report['invoice_summary'],
+                      'alerts_count': len(report['alerts']),
+                      'recommendations_count': len(report['recommendations'])
+                  }
+                  
+              except Exception as e:
+                  logger.error(f"Error generating report: {str(e)}")
+                  return {'success': False, 'error': str(e)}
+
+  NotificationFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-notification-${Environment}'
+      Runtime: python3.9
+      Handler: lambda_function.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 60
+      MemorySize: 128
+      Environment:
+        Variables:
+          SNS_TOPIC_ARN: !Ref NotificationTopic
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import logging
+          import os
+          from datetime import datetime
+          
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+          sns_client = boto3.client('sns')
+          
+          def lambda_handler(event, context):
+              try:
+                  logger.info(f"Sending notification: {json.dumps(event, default=str)}")
+                  
+                  job_id = event['job_id']
+                  status = event['status']
+                  sns_topic_arn = os.environ.get('SNS_TOPIC_ARN')
+                  
+                  if status == 'completed':
+                      results_summary = event.get('results_summary', {})
+                      alerts = event.get('alerts', [])
+                      
+                      # Create notification message
+                      message = f"""
+PayScan AI Agent - Processing Complete
+
+Job ID: {job_id}
+Status: {status}
+Timestamp: {datetime.utcnow().isoformat()}
+
+Invoice Summary:
+- Invoice ID: {results_summary.get('invoice_id', 'N/A')}
+- Vendor: {results_summary.get('vendor', 'N/A')}
+- Amount: ${results_summary.get('amount', 'N/A')}
+- Due Date: {results_summary.get('due_date', 'N/A')}
+- Risk Level: {results_summary.get('risk_level', 'N/A')}
+
+Alerts Generated: {len(alerts)}
+"""
+                      
+                      if alerts:
+                          message += "\nAlerts:\n"
+                          for alert in alerts[:3]:  # Show first 3 alerts
+                              message += f"- {alert.get('severity', 'Unknown').upper()}: {alert.get('title', 'Alert')}\n"
+                  
+                  elif status == 'failed':
+                      error_type = event.get('error_type', 'unknown')
+                      error_details = event.get('error_details', {})
+                      
+                      message = f"""
+PayScan AI Agent - Processing Failed
+
+Job ID: {job_id}
+Status: {status}
+Error Type: {error_type}
+Timestamp: {datetime.utcnow().isoformat()}
+
+Error Details: {json.dumps(error_details, indent=2)}
+"""
+                  
+                  else:
+                      message = f"""
+PayScan AI Agent - Status Update
+
+Job ID: {job_id}
+Status: {status}
+Timestamp: {datetime.utcnow().isoformat()}
+"""
+                  
+                  # Send SNS notification
+                  if sns_topic_arn:
+                      sns_client.publish(
+                          TopicArn=sns_topic_arn,
+                          Subject=f"PayScan AI Agent - {status.title()} ({job_id})",
+                          Message=message
+                      )
+                  
+                  return {
+                      'success': True,
+                      'job_id': job_id,
+                      'notification_sent': True
+                  }
+                  
+              except Exception as e:
+                  logger.error(f"Error sending notification: {str(e)}")
+                  return {'success': False, 'error': str(e)}
+
+  # S3 Bucket Permissions for Lambda
+  S3InvokeLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !GetAtt OrchestratorFunction.Arn
+      Principal: s3.amazonaws.com
+      SourceArn: !GetAtt UploadBucket.Arn
+
+  # Step Functions State Machine
+  ProcessingStateMachine:
+    Type: AWS::StepFunctions::StateMachine
+    Properties:
+      StateMachineName: !Sub '${ProjectName}-processing-${Environment}'
+      RoleArn: !GetAtt StepFunctionsExecutionRole.Arn
+      DefinitionString: !Sub |
+        {
+          "Comment": "PayScan AI Agent - Invoice Processing Workflow",
+          "StartAt": "ValidateInput",
+          "States": {
+            "ValidateInput": {
+              "Type": "Pass",
+              "Comment": "Validate input parameters",
+              "Parameters": {
+                "job_id.$": "$.job_id",
+                "source_bucket.$": "$.source_bucket",
+                "source_key.$": "$.source_key",
+                "sagemaker_endpoint.$": "$.sagemaker_endpoint",
+                "processing_bucket.$": "$.processing_bucket",
+                "results_bucket.$": "$.results_bucket",
+                "timestamp.$": "$.State.EnteredTime"
+              },
+              "Next": "CheckSageMakerEndpoint"
+            },
+            "CheckSageMakerEndpoint": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::lambda:invoke",
+              "Parameters": {
+                "FunctionName": "${OrchestratorFunction}",
+                "Payload": {
+                  "action": "check_endpoint",
+                  "job_id.$": "$.job_id"
+                }
+              },
+              "ResultPath": "$.endpoint_status",
+              "Next": "IsEndpointReady",
+              "Retry": [
+                {
+                  "ErrorEquals": ["States.TaskFailed"],
+                  "IntervalSeconds": 30,
+                  "MaxAttempts": 3,
+                  "BackoffRate": 2.0
+                }
+              ]
+            },
+            "IsEndpointReady": {
+              "Type": "Choice",
+              "Choices": [
+                {
+                  "Variable": "$.endpoint_status.Payload.status",
+                  "StringEquals": "InService",
+                  "Next": "ExtractWithTextract"
+                },
+                {
+                  "Variable": "$.endpoint_status.Payload.status",
+                  "StringEquals": "Creating",
+                  "Next": "WaitForEndpoint"
+                }
+              ],
+              "Default": "StartEndpoint"
+            },
+            "StartEndpoint": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::lambda:invoke",
+              "Parameters": {
+                "FunctionName": "${OrchestratorFunction}",
+                "Payload": {
+                  "action": "start_endpoint",
+                  "job_id.$": "$.job_id"
+                }
+              },
+              "ResultPath": "$.endpoint_start_result",
+              "Next": "WaitForEndpoint"
+            },
+            "WaitForEndpoint": {
+              "Type": "Wait",
+              "Seconds": 300,
+              "Next": "CheckSageMakerEndpoint"
+            },
+            "ExtractWithTextract": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::lambda:invoke",
+              "Parameters": {
+                "FunctionName": "${TextractFunction}",
+                "Payload": {
+                  "source_bucket.$": "$.source_bucket",
+                  "source_key.$": "$.source_key",
+                  "job_id.$": "$.job_id",
+                  "processing_bucket.$": "$.processing_bucket"
+                }
+              },
+              "ResultPath": "$.textract_result",
+              "Next": "ProcessWithSageMaker"
+            },
+            "ProcessWithSageMaker": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::lambda:invoke",
+              "Parameters": {
+                "FunctionName": "${SageMakerFunction}",
+                "Payload": {
+                  "textract_data.$": "$.textract_result.Payload",
+                  "sagemaker_endpoint.$": "$.sagemaker_endpoint",
+                  "job_id.$": "$.job_id",
+                  "processing_bucket.$": "$.processing_bucket"
+                }
+              },
+              "ResultPath": "$.sagemaker_result",
+              "Next": "AnalyzeWithBedrock"
+            },
+            "AnalyzeWithBedrock": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::lambda:invoke",
+              "Parameters": {
+                "FunctionName": "${BedrockFunction}",
+                "Payload": {
+                  "invoice_data.$": "$.sagemaker_result.Payload",
+                  "textract_data.$": "$.textract_result.Payload",
+                  "job_id.$": "$.job_id",
+                  "processing_bucket.$": "$.processing_bucket"
+                }
+              },
+              "ResultPath": "$.bedrock_result",
+              "Next": "StoreResults"
+            },
+            "StoreResults": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::lambda:invoke",
+              "Parameters": {
+                "FunctionName": "${StorageFunction}",
+                "Payload": {
+                  "job_id.$": "$.job_id",
+                  "textract_data.$": "$.textract_result.Payload",
+                  "sagemaker_data.$": "$.sagemaker_result.Payload",
+                  "bedrock_data.$": "$.bedrock_result.Payload",
+                  "results_bucket.$": "$.results_bucket",
+                  "source_info": {
+                    "bucket.$": "$.source_bucket",
+                    "key.$": "$.source_key"
+                  }
+                }
+              },
+              "ResultPath": "$.storage_result",
+              "Next": "CheckForDuplicates"
+            },
+            "CheckForDuplicates": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::lambda:invoke",
+              "Parameters": {
+                "FunctionName": "${DuplicateFunction}",
+                "Payload": {
+                  "job_id.$": "$.job_id",
+                  "invoice_data.$": "$.bedrock_result.Payload.curated_invoice_data",
+                  "results_bucket.$": "$.results_bucket"
+                }
+              },
+              "ResultPath": "$.duplicate_check",
+              "Next": "GenerateReport"
+            },
+            "GenerateReport": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::lambda:invoke",
+              "Parameters": {
+                "FunctionName": "${ReportFunction}",
+                "Payload": {
+                  "job_id.$": "$.job_id",
+                  "processing_results": {
+                    "textract.$": "$.textract_result.Payload",
+                    "sagemaker.$": "$.sagemaker_result.Payload",
+                    "bedrock.$": "$.bedrock_result.Payload",
+                    "duplicate_check.$": "$.duplicate_check.Payload",
+                    "storage.$": "$.storage_result.Payload"
+                  },
+                  "results_bucket.$": "$.results_bucket"
+                }
+              },
+              "ResultPath": "$.report_result",
+              "Next": "SendNotification"
+            },
+            "SendNotification": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::lambda:invoke",
+              "Parameters": {
+                "FunctionName": "${NotificationFunction}",
+                "Payload": {
+                  "job_id.$": "$.job_id",
+                  "status": "completed",
+                  "results_summary.$": "$.report_result.Payload.summary",
+                  "alerts.$": "$.bedrock_result.Payload.curated_invoice_data.alerts"
+                }
+              },
+              "ResultPath": "$.notification_result",
+              "Next": "StopSageMakerEndpoint"
+            },
+            "StopSageMakerEndpoint": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::lambda:invoke",
+              "Parameters": {
+                "FunctionName": "${OrchestratorFunction}",
+                "Payload": {
+                  "action": "stop_endpoint",
+                  "job_id.$": "$.job_id"
+                }
+              },
+              "ResultPath": "$.endpoint_stop_result",
+              "Next": "ProcessingComplete"
+            },
+            "ProcessingComplete": {
+              "Type": "Pass",
+              "End": true
+            }
+          }
+        }
+
+  # API Gateway for external access
+  PayScanAPI:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      Name: !Sub '${ProjectName}-api-${Environment}'
+      Description: PayScan AI Agent API
+      EndpointConfiguration:
+        Types:
+          - REGIONAL
+
+  APIDeployment:
+    Type: AWS::ApiGateway::Deployment
+    DependsOn:
+      - UploadMethod
+      - ProcessMethod
+      - StatusMethod
+      - InvoicesMethod
+    Properties:
+      RestApiId: !Ref PayScanAPI
+      StageName: !Ref Environment
+
+  # API Gateway Resources and Methods
+  UploadResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref PayScanAPI
+      ParentId: !GetAtt PayScanAPI.RootResourceId
+      PathPart: upload
+
+  UploadMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref PayScanAPI
+      ResourceId: !Ref UploadResource
+      HttpMethod: POST
+      AuthorizationType: NONE
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${OrchestratorFunction.Arn}/invocations'
+
+  ProcessResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref PayScanAPI
+      ParentId: !GetAtt PayScanAPI.RootResourceId
+      PathPart: process
+
+  ProcessMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref PayScanAPI
+      ResourceId: !Ref ProcessResource
+      HttpMethod: POST
+      AuthorizationType: NONE
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${OrchestratorFunction.Arn}/invocations'
+
+  StatusResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref PayScanAPI
+      ParentId: !GetAtt PayScanAPI.RootResourceId
+      PathPart: status
+
+  StatusMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref PayScanAPI
+      ResourceId: !Ref StatusResource
+      HttpMethod: GET
+      AuthorizationType: NONE
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${OrchestratorFunction.Arn}/invocations'
+
+  InvoicesResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref PayScanAPI
+      ParentId: !GetAtt PayScanAPI.RootResourceId
+      PathPart: invoices
+
+  InvoicesMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref PayScanAPI
+      ResourceId: !Ref InvoicesResource
+      HttpMethod: GET
+      AuthorizationType: NONE
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${OrchestratorFunction.Arn}/invocations'
+
+  # API Gateway Lambda Permissions
+  APIGatewayInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !GetAtt OrchestratorFunction.Arn
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${PayScanAPI}/*/*/*'
+
+Outputs:
+  UploadBucketName:
+    Description: S3 bucket for uploading invoices
+    Value: !Ref UploadBucket
+    Export:
+      Name: !Sub '${ProjectName}-upload-bucket-${Environment}'
+
+  ProcessingBucketName:
+    Description: S3 bucket for processing data
+    Value: !Ref ProcessingBucket
+    Export:
+      Name: !Sub '${ProjectName}-processing-bucket-${Environment}'
+
+  ResultsBucketName:
+    Description: S3 bucket for results
+    Value: !Ref ResultsBucket
+    Export:
+      Name: !Sub '${ProjectName}-results-bucket-${Environment}'
+
+  APIGatewayURL:
+    Description: API Gateway URL
+    Value: !Sub 'https://${PayScanAPI}.execute-api.${AWS::Region}.amazonaws.com/${Environment}'
+    Export:
+      Name: !Sub '${ProjectName}-api-url-${Environment}'
+
+  StateMachineArn:
+    Description: Step Functions State Machine ARN
+    Value: !Ref ProcessingStateMachine
+    Export:
+      Name: !Sub '${ProjectName}-state-machine-${Environment}'
+
+  DynamoDBTableName:
+    Description: DynamoDB table for agent memory
+    Value: !Ref AgentMemoryTable
+    Export:
+      Name: !Sub '${ProjectName}-memory-table-${Environment}'
+
+  SNSTopicArn:
+    Description: SNS topic for notifications
+    Value: !Ref NotificationTopic
+    Export:
+      Name: !Sub '${ProjectName}-sns-topic-${Environment}'
