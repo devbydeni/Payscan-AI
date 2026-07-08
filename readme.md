@@ -5,7 +5,7 @@
 
 [![AWS](https://img.shields.io/badge/AWS-Cloud%20Native-orange)](https://aws.amazon.com/)
 [![Python](https://img.shields.io/badge/Python-3.9+-blue)](https://python.org/)
-[![License](https://img.shields.io/badge/License-MIT-green)](LICENSE)
+[![License](https://img.shields.io/badge/License-GPL-green)](LICENSE)
 
 ##  What is PayScan AI Agent?
 
