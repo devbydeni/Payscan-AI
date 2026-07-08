@@ -222,6 +222,5 @@ aws logs filter-log-events \
 
 ---
 
-**Made with ❤️ by Postleo**
 
 *Transform your invoice processing today - from manual entry to intelligent automation in minutes, not months.*
