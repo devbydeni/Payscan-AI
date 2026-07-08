@@ -1,0 +1,94 @@
+
+name: Unzip Archives
+
+on:
+  workflow_dispatch:
+    inputs:
+      pattern:
+        description: "Glob for the archives to extract (e.g. **/*.zip or assets/*.zip)"
+        required: false
+        default: "**/*.zip"
+      destination:
+        description: "Where extracted files go: 'alongside' (next to each zip), '.' (repository root), or a folder name (e.g. unpacked)"
+        required: false
+        default: "alongside"
+      flatten:
+        description: "Put contents straight into the destination instead of a folder named after each archive"
+        type: boolean
+        default: false
+      strip_top_level_folder:
+        description: "If a zip wraps everything in one top-level folder, drop that folder so the contents land directly"
+        type: boolean
+        default: false
+      delete_zip:
+        description: "Delete each .zip after it is extracted"
+        type: boolean
+        default: true
+      target_branch:
+        description: "Branch to commit the extracted files to (leave blank to use the branch this run was started from)"
+        required: false
+        default: ""
+      create_branch:
+        description: "Create the target branch if it does not already exist"
+        type: boolean
+        default: false
+
+permissions:
+  contents: write # required so the action can commit the extracted files back
+
+jobs:
+  unzip:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # fetch all branches so we can switch to / create any branch
+
+      - name: Select target branch
+        id: branch
+        run: |
+          set -euo pipefail
+          target="${{ inputs.target_branch }}"
+          if [ -z "$target" ]; then
+            target="${GITHUB_REF_NAME}"
+            echo "No target branch given; using the current branch: $target"
+          fi
+
+          if [ "${{ inputs.create_branch }}" = "true" ]; then
+            if git show-ref --verify --quiet "refs/remotes/origin/$target"; then
+              echo "Branch '$target' already exists on the remote; checking it out."
+              git checkout "$target"
+            else
+              echo "Creating new branch '$target'."
+              git checkout -b "$target"
+            fi
+          else
+            if git show-ref --verify --quiet "refs/remotes/origin/$target"; then
+              git checkout "$target"
+            else
+              echo "::error::Branch '$target' does not exist. Re-run with 'create_branch' enabled to create it."
+              exit 1
+            fi
+          fi
+
+          echo "branch=$target" >> "$GITHUB_OUTPUT"
+
+      - name: Unzip archives
+        id: unzip
+        uses: postleo/unzipp@v1
+        with:
+          pattern: ${{ inputs.pattern }}
+          destination: ${{ inputs.destination }}
+          flatten: ${{ inputs.flatten }}
+          # Map the friendly boolean to the action's strip-components input.
+          strip-components: ${{ inputs.strip_top_level_folder && '1' || '0' }}
+          delete-zip: ${{ inputs.delete_zip }}
+          commit: "true"
+          commit-message: "chore: unzip archives [skip ci]"
+
+      - name: Summary
+        run: |
+          echo "Extracted ${{ steps.unzip.outputs.extracted-count }} archive(s)."
+          echo "Committed:  ${{ steps.unzip.outputs.committed }}"
+          echo "Branch:     ${{ steps.branch.outputs.branch }}"
